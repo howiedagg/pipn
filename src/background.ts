@@ -1,45 +1,66 @@
-let dummyTabId: number | null = null;
-let originalTabId: number | null = null;
-let originalWindowId: number | null = null;
-
 let isFirefoxFocused = true;
 let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
-let activeWindowId: number | null = null;
-let activeTabId: number | null = null;
+// 💡 透過瀏覽器的持久化儲存，避免擴充功能休眠後變數遺失
+async function getState() {
+	const res = await browser.storage.local.get(['pipnState']);
+	return (
+		res.pipnState || {
+			dummyTabId: null,
+			originalTabId: null,
+			originalWindowId: null,
+			activeWindowId: null,
+			activeTabId: null,
+		}
+	);
+}
 
+async function updateState(updates: any) {
+	const state = await getState();
+	const newState = { ...state, ...updates };
+	await browser.storage.local.set({ pipnState: newState });
+	return newState;
+}
+
+// 初始化追蹤狀態
 browser.windows.getCurrent().then(async (win) => {
 	if (win && win.id !== undefined) {
-		activeWindowId = win.id;
-		try {
-			const tabs = await browser.tabs.query({ active: true, windowId: win.id });
-			if (tabs.length > 0) activeTabId = tabs[0].id ?? null;
-		} catch {}
+		const state = await getState();
+		if (!state.activeWindowId) {
+			let currentTabId = null;
+			try {
+				const tabs = await browser.tabs.query({ active: true, windowId: win.id });
+				if (tabs.length > 0) currentTabId = tabs[0].id ?? null;
+			} catch {}
+			await updateState({ activeWindowId: win.id, activeTabId: currentTabId });
+		}
 	}
 });
 
-browser.tabs.onActivated.addListener((activeInfo) => {
-	if (activeInfo.tabId === dummyTabId) return;
+browser.tabs.onActivated.addListener(async (activeInfo) => {
+	const state = await getState();
+	if (activeInfo.tabId === state.dummyTabId) return;
 
-	activeWindowId = activeInfo.windowId;
-	activeTabId = activeInfo.tabId;
+	await updateState({
+		activeWindowId: activeInfo.windowId,
+		activeTabId: activeInfo.tabId,
+	});
 });
 
 async function handleFocusLoss() {
-	if (dummyTabId !== null) return;
-	if (!activeWindowId || !activeTabId) return;
+	const state = await getState();
+
+	if (state.dummyTabId !== null) return;
+	if (!state.activeWindowId || !state.activeTabId) return;
 
 	try {
-		const tab = await browser.tabs.get(activeTabId);
+		const tab = await browser.tabs.get(state.activeTabId);
 		if (!tab || !tab.audible) return;
 
 		if (isFirefoxFocused) return;
 
-		originalTabId = activeTabId;
-		originalWindowId = activeWindowId;
-
 		const dummyTab = await browser.tabs.create({
-			windowId: originalWindowId,
+			windowId: state.activeWindowId,
 			url: 'about:blank',
 			active: false,
 		});
@@ -53,12 +74,17 @@ async function handleFocusLoss() {
 			return;
 		}
 
-		dummyTabId = dummyTab.id ?? null;
+		const newDummyTabId = dummyTab.id ?? null;
+		await updateState({
+			dummyTabId: newDummyTabId,
+			originalTabId: state.activeTabId,
+			originalWindowId: state.activeWindowId,
+		});
 
 		timeoutId = setTimeout(async () => {
-			if (dummyTabId && !isFirefoxFocused) {
+			if (newDummyTabId && !isFirefoxFocused) {
 				try {
-					await browser.tabs.update(dummyTabId, { active: true });
+					await browser.tabs.update(newDummyTabId, { active: true });
 				} catch {}
 			}
 		}, 50);
@@ -71,38 +97,55 @@ async function handleFocusGain(focusedWindowId: number) {
 		timeoutId = null;
 	}
 
-	if (!dummyTabId || !originalTabId || !originalWindowId) {
-		activeWindowId = focusedWindowId;
+	const state = await getState();
+
+	if (!state.dummyTabId || !state.originalTabId || !state.originalWindowId) {
+		let currentTabId = null;
 		try {
 			const tabs = await browser.tabs.query({ active: true, windowId: focusedWindowId });
-			if (tabs.length > 0) activeTabId = tabs[0].id ?? null;
+			if (tabs.length > 0) currentTabId = tabs[0].id ?? null;
 		} catch {}
+		await updateState({
+			activeWindowId: focusedWindowId,
+			activeTabId: currentTabId,
+		});
 		return;
 	}
 
-	const dTabId = dummyTabId;
-	const oTabId = originalTabId;
-	const oWinId = originalWindowId;
+	const dTabId = state.dummyTabId;
+	const oTabId = state.originalTabId;
+	const oWinId = state.originalWindowId;
 
-	dummyTabId = null;
-	originalTabId = null;
-	originalWindowId = null;
+	// 無論接下來成不成功，先清空追蹤狀態以避免卡死
+	await updateState({
+		dummyTabId: null,
+		originalTabId: null,
+		originalWindowId: null,
+	});
 
+	// 💡 關鍵修正：將「還原」跟「移除」分開捕捉錯誤
+	// 如果還原影片分頁失敗(例如被系統關閉了)，我們依然要保證能刪除空白頁
 	try {
 		await browser.tabs.update(oTabId, { active: true });
+	} catch {
+		// Original tab might have been closed or suspended
+	}
+
+	try {
 		await browser.tabs.remove(dTabId);
 	} catch {
-		// Original tab or dummy tab might have been closed
+		// Dummy tab might have been closed manually
 	}
 
 	if (focusedWindowId !== oWinId) {
 		try {
-			// Force focus back to the original window
 			await browser.windows.update(oWinId, { focused: true });
 		} catch {}
 	} else {
-		activeWindowId = focusedWindowId;
-		activeTabId = oTabId;
+		await updateState({
+			activeWindowId: focusedWindowId,
+			activeTabId: oTabId,
+		});
 	}
 }
 
@@ -117,10 +160,13 @@ browser.windows.onFocusChanged.addListener(async (windowId) => {
 	}
 });
 
-browser.tabs.onRemoved.addListener((tabId) => {
-	if (tabId === dummyTabId) {
-		dummyTabId = null;
-		originalTabId = null;
-		originalWindowId = null;
+browser.tabs.onRemoved.addListener(async (tabId) => {
+	const state = await getState();
+	if (tabId === state.dummyTabId) {
+		await updateState({
+			dummyTabId: null,
+			originalTabId: null,
+			originalWindowId: null,
+		});
 	}
 });

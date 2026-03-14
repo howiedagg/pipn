@@ -6,7 +6,8 @@
     "author": "Gavin Kondrath",
     "homepage_url": "https://github.com/gavink97/pipn",
     "permissions": [
-        "tabs"
+        "tabs",
+        "storage"
     ],
     "icons": {
         "48": "icons/icon-48.png",
